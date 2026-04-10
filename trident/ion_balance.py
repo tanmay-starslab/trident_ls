@@ -683,12 +683,19 @@ def _ion_mass(field, data):
         return data[ftype,fraction_field_name] * \
           data[ftype, nuclei_field]
 
-    # try the species metallicity
+    # try the species metallicity and fraction fields
+    # gizmo uses X_metallicity fields, AREPO+Gadget use X_fraction fields
+    # but they are intrinsically the same: mass fractions of total density field
     metallicity_field = "%s_metallicity" % atom
+    fraction_field = "%s_fraction" % atom
     if (ftype, metallicity_field) in data.ds.field_info:
         return data[ftype,fraction_field_name] * \
           data[ftype, "mass"] * \
           data[ftype, metallicity_field]
+    elif (ftype, fraction_field) in data.ds.field_info:
+        return data[ftype,fraction_field_name] * \
+          data[ftype, "mass"] * \
+          data[ftype, fraction_field]
 
     if atom == 'H' or atom == 'He':
         mass_fraction = solar_abundance[atom] * data[ftype,fraction_field_name]
