@@ -17,7 +17,9 @@ from trident.ion_balance import \
     add_ion_density_field, \
     add_ion_mass_field, \
     add_ion_fields, \
-    calculate_ion_fraction
+    calculate_ion_fraction, \
+    atomic_mass, \
+    mh
 from yt import \
     load, \
     SlicePlot
@@ -351,3 +353,68 @@ def test_calculate_ion_fraction():
     # Does it return all hydrogen being ionized at 1e7 K?
     assert calculate_ion_fraction('H II', 1e-2, 1e7, 0) == 1
 
+def test_species_fraction_field_is_used_for_ion_mass_and_number_density():
+    """
+    Ensure Gadget/AREPO-style X_fraction fields are used in preference to the
+    bulk metallicity field when X_metallicity is absent.
+    """
+    ds = fake_random_ds(
+        8,
+        fields=("density", "temperature", "metallicity", "Mg_fraction"),
+        units=('g/cm**3', 'K', '', '')
+    )
+
+    ftype = ds.default_fluid_type
+
+    def _fixed_metallicity(field, data):
+        return data.ds.arr(
+            np.ones(data[(ftype, "density")].shape) * 1.0e-6, ""
+        )
+
+    def _fixed_mg_fraction(field, data):
+        return data.ds.arr(
+            np.ones(data[(ftype, "density")].shape) * 2.0e-2, ""
+        )
+
+    ds.add_field(
+        (ftype, "metallicity"),
+        function=_fixed_metallicity,
+        sampling_type="cell",
+        units="",
+        force_override=True,
+    )
+    ds.add_field(
+        (ftype, "Mg_fraction"),
+        function=_fixed_mg_fraction,
+        sampling_type="cell",
+        units="",
+        force_override=True,
+    )
+
+    ad = ds.all_data()
+
+    # Add the fields under test on the dataset's actual fluid type.
+    add_ion_fields(ds, ["Mg II"], ftype=ftype)
+
+    ion_frac = ad[(ftype, "Mg_p1_ion_fraction")]
+    ion_mass = ad[(ftype, "Mg_p1_mass")]
+    ion_ndens = ad[(ftype, "Mg_p1_number_density")]
+
+    density = ad[(ftype, "density")]
+    mass = ad[(ftype, "mass")]
+    mg_fraction = ad[(ftype, "Mg_fraction")]
+    bulk_metallicity = ad[(ftype, "metallicity")]
+
+    # The fixed code should use Mg_fraction.
+    expected_mass = ion_frac * mass * mg_fraction
+    expected_ndens = ion_frac * density * mg_fraction / (atomic_mass["Mg"] * mh)
+
+    assert_array_rel_equal(ion_mass, expected_mass, decimals=15)
+    assert_array_rel_equal(ion_ndens, expected_ndens, decimals=15)
+
+    # And specifically should not be using the bulk metallicity fallback.
+    wrong_mass = ion_frac * mass * bulk_metallicity
+    wrong_ndens = ion_frac * density * bulk_metallicity / (atomic_mass["Mg"] * mh)
+
+    assert not np.allclose(ion_mass, wrong_mass)
+    assert not np.allclose(ion_ndens, wrong_ndens)
