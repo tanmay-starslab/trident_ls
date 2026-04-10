@@ -746,12 +746,20 @@ def _ion_number_density(field, data):
         return data[ftype, fraction_field_name] * \
           data[(ftype, nuclei_field)] / (atomic_mass[atom] * mh)
 
-    # try the species metallicity
+    # try the species metallicity and fraction fields
+    # gizmo uses X_metallicity fields, AREPO+Gadget use X_fraction fields
+    # but they are intrinsically the same: mass fractions of total density field
     metallicity_field = "%s_metallicity" % atom
+    fraction_field = "%s_fraction" % atom
     if (ftype, metallicity_field) in data.ds.field_info:
         return data[ftype, fraction_field_name] * \
           data[ftype, "density"] * \
           data[ftype, metallicity_field] / \
+          atomic_mass[atom] / mh
+    elif (ftype, fraction_field) in data.ds.field_info:
+        return data[ftype, fraction_field_name] * \
+          data[ftype, "density"] * \
+          data[ftype, fraction_field] / \
           atomic_mass[atom] / mh
 
     if atom == 'H' or atom == 'He':
