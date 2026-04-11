@@ -8,12 +8,16 @@ build:
   tools:
     python: "3.12"
 
+submodules:
+  include: all
+  recursive: true
+
 sphinx:
   configuration: doc/source/conf.py
 
 python:
   install:
-  - method: pip
-    path: .
-    extra_requirements:
-      - dev
+    - method: pip
+      path: .
+      extra_requirements:
+        - dev
