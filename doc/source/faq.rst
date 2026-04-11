@@ -71,6 +71,27 @@ What functions are available and what is their syntax?
 Go see the full documentation for all of our available classes and functions in the
 :ref:`API Documentation <api-reference>`.
 
+How to get rid of discontinuities in absorption features?
+---------------------------------------------------------
+
+When depositing absorption features in spectra, Trident guesses as to how wide
+a line feature is going to be and deposits the feature.  If at the edges of 
+this "width window", the optical depth is greater than a `min_tau` value, 
+then Trident doubles the size of the window and repeats the process until the
+threshold is met.  Occasionally, with very deep lines like Lyman-alpha, the 
+default `min_tau` value is too large, and it can result in discontinuities
+in the edge of the absorption feature (see below).
+
+When this happens, you can decrease the `min_tau` value directly in the 
+:meth:`~trident.absorption_spectrum.absorption_spectrum.AbsorptionSpectrum.make_spectrum`
+function to extend the window farther.  However, this is
+more computationally expensive, where each factor of ten change will result in
+roughly a 2x slow down.
+
+.. image:: trident-docs-images/faq/min_tau1.png
+
+.. image:: trident-docs-images/faq/min_tau2.png
+
 What version of Trident am I running?
 -------------------------------------
 
