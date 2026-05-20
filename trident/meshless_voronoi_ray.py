@@ -20,6 +20,7 @@ spectrum-generation machinery.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Iterable, Optional, Tuple
 
@@ -106,6 +107,79 @@ class MeshlessVoronoiRay:
         }
 
 
+@dataclass(frozen=True)
+class MeshlessVoronoiRayBatch:
+    """Compact ragged container for many meshless Voronoi rays."""
+
+    ray_offsets: np.ndarray
+    indices: np.ndarray
+    dl: np.ndarray
+    start_positions: np.ndarray
+    end_positions: np.ndarray
+    directions: np.ndarray
+    lengths: np.ndarray
+    start_indices: np.ndarray
+    end_indices: np.ndarray
+    failed_stack_recoveries: np.ndarray
+    fallback_counts: np.ndarray
+    nudge_counts: np.ndarray
+    eps: float = np.nan
+    periodic: bool = False
+    box_size: Optional[np.ndarray] = None
+    algorithm_version: str = "salsa_meshless_voronoi_v1"
+
+    def __len__(self) -> int:
+        return max(len(self.ray_offsets) - 1, 0)
+
+    @property
+    def n_rays(self) -> int:
+        """Number of rays stored in the batch."""
+        return len(self)
+
+    @property
+    def n_segments(self) -> np.ndarray:
+        """Number of flattened segments belonging to each ray."""
+        return np.diff(self.ray_offsets)
+
+    @property
+    def cumulative_dl(self) -> np.ndarray:
+        """Per-ray cumulative segment distances in flattened order."""
+        cumulative = np.empty_like(self.dl)
+        for ray_id in range(len(self)):
+            start = self.ray_offsets[ray_id]
+            end = self.ray_offsets[ray_id + 1]
+            cumulative[start:end] = np.cumsum(self.dl[start:end])
+        return cumulative
+
+    def ray(self, ray_id: int) -> MeshlessVoronoiRay:
+        """Return a single ray from the batch as ``MeshlessVoronoiRay``."""
+        if ray_id < 0 or ray_id >= len(self):
+            raise IndexError("ray_id out of range")
+        start = self.ray_offsets[ray_id]
+        end = self.ray_offsets[ray_id + 1]
+        return MeshlessVoronoiRay(
+            indices=np.asarray(self.indices[start:end], dtype=np.int64),
+            dl=np.asarray(self.dl[start:end], dtype=np.float64),
+            start_position=np.asarray(self.start_positions[ray_id], dtype=np.float64),
+            end_position=np.asarray(self.end_positions[ray_id], dtype=np.float64),
+            direction=np.asarray(self.directions[ray_id], dtype=np.float64),
+            length=float(self.lengths[ray_id]),
+            start_index=int(self.start_indices[ray_id]),
+            end_index=int(self.end_indices[ray_id]),
+            failed_stack_recoveries=int(self.failed_stack_recoveries[ray_id]),
+            fallback_count=int(self.fallback_counts[ray_id]),
+            nudge_count=int(self.nudge_counts[ray_id]),
+            eps=float(self.eps),
+            periodic=bool(self.periodic),
+            box_size=None if self.box_size is None else np.asarray(self.box_size),
+            algorithm_version=self.algorithm_version,
+        )
+
+    def to_list(self) -> list[MeshlessVoronoiRay]:
+        """Return all rays as a list of ``MeshlessVoronoiRay`` objects."""
+        return [self.ray(ray_id) for ray_id in range(len(self))]
+
+
 class MeshlessVoronoiRayTracer:
     """Mesh-free ray tracer for Voronoi tessellations.
 
@@ -174,6 +248,69 @@ class MeshlessVoronoiRayTracer:
         """Return index of the Voronoi site nearest to point."""
         p = self._wrap_point(np.asarray(point, dtype=np.float64))
         return int(self.tree.query(p, k=1)[1])
+
+    def nearest_indices(self, points: np.ndarray, workers: int = 1) -> np.ndarray:
+        """Return nearest Voronoi site indices for many points."""
+        p = self._wrap_point(np.asarray(points, dtype=np.float64))
+        try:
+            return np.asarray(self.tree.query(p, k=1, workers=workers)[1], dtype=np.int64)
+        except TypeError:  # scipy versions before the workers keyword
+            return np.asarray(self.tree.query(p, k=1)[1], dtype=np.int64)
+
+    def trace_rays(
+        self,
+        start_positions: np.ndarray,
+        end_positions: Optional[np.ndarray] = None,
+        directions: Optional[np.ndarray] = None,
+        lengths: Optional[np.ndarray] = None,
+        parallel: str = "none",
+        n_jobs: int = 1,
+        chunksize: Optional[int] = None,
+        return_format: str = "list",
+    ):
+        """Trace many rays while reusing this tracer's nearest-neighbor tree."""
+        using_end_positions = end_positions is not None
+        starts, ends, dirs, lens = self._prepare_batch_inputs(
+            start_positions, end_positions, directions, lengths
+        )
+        nrays = len(starts)
+        if chunksize is None or chunksize <= 0:
+            chunksize = nrays if nrays else 1
+
+        all_rays = []
+        for first in range(0, nrays, chunksize):
+            last = min(first + chunksize, nrays)
+            if parallel == "none" or n_jobs == 1:
+                if using_end_positions:
+                    rays = [
+                        self.trace_ray(starts[i], end_position=ends[i])
+                        for i in range(first, last)
+                    ]
+                else:
+                    rays = [
+                        self.trace_ray(starts[i], direction=dirs[i], length=lens[i])
+                        for i in range(first, last)
+                    ]
+            elif parallel == "threads":
+                if using_end_positions:
+                    def _trace(item):
+                        return self.trace_ray(item[0], end_position=item[1])
+                    iterable = zip(starts[first:last], ends[first:last])
+                else:
+                    def _trace(item):
+                        return self.trace_ray(item[0], direction=item[1], length=item[2])
+                    iterable = zip(starts[first:last], dirs[first:last], lens[first:last])
+                with ThreadPoolExecutor(max_workers=int(n_jobs)) as executor:
+                    rays = list(executor.map(_trace, iterable))
+            else:
+                raise ValueError("parallel must be 'none' or 'threads'.")
+            all_rays.extend(rays)
+
+        if return_format == "list":
+            return all_rays
+        if return_format == "ragged":
+            return self._rays_to_batch(all_rays, starts, ends, dirs, lens)
+        raise ValueError("return_format must be 'list' or 'ragged'.")
 
     def trace_ray(
         self,
@@ -290,6 +427,77 @@ class MeshlessVoronoiRayTracer:
             failed_stack_recoveries=int(failed_stack_recoveries),
             fallback_count=int(fallback_count),
             nudge_count=int(nudge_count),
+            eps=float(self.eps),
+            periodic=self.box_size is not None,
+            box_size=None if self.box_size is None else np.asarray(self.box_size),
+        )
+
+    def _prepare_batch_inputs(
+        self,
+        start_positions: np.ndarray,
+        end_positions: Optional[np.ndarray],
+        directions: Optional[np.ndarray],
+        lengths: Optional[np.ndarray],
+    ):
+        starts = np.ascontiguousarray(start_positions, dtype=np.float64)
+        if starts.ndim != 2 or starts.shape[1] != 3:
+            raise ValueError("start_positions must have shape (M, 3).")
+        if end_positions is not None:
+            ends = np.ascontiguousarray(end_positions, dtype=np.float64)
+            if ends.shape != starts.shape:
+                raise ValueError("end_positions must have shape (M, 3).")
+            deltas = self._minimum_image(ends - starts)
+            lens = np.linalg.norm(deltas, axis=1)
+            if np.any(lens <= 0):
+                raise ValueError("All ray lengths must be positive.")
+            dirs = deltas / lens[:, None]
+            return starts, starts + dirs * lens[:, None], dirs, lens
+
+        if directions is None or lengths is None:
+            raise ValueError("Provide end_positions or both directions and lengths.")
+        dirs = np.ascontiguousarray(directions, dtype=np.float64)
+        if dirs.shape != starts.shape:
+            raise ValueError("directions must have shape (M, 3).")
+        norm = np.linalg.norm(dirs, axis=1)
+        if np.any(norm <= 0):
+            raise ValueError("All directions must be non-zero.")
+        dirs = dirs / norm[:, None]
+        lens = np.ascontiguousarray(lengths, dtype=np.float64)
+        if lens.shape != (len(starts),):
+            raise ValueError("lengths must have shape (M,).")
+        if np.any(lens <= 0):
+            raise ValueError("All lengths must be positive.")
+        ends = starts + dirs * lens[:, None]
+        return starts, ends, dirs, lens
+
+    def _rays_to_batch(self, rays, starts, ends, directions, lengths):
+        offsets = np.zeros(len(rays) + 1, dtype=np.int64)
+        for i, ray in enumerate(rays):
+            offsets[i + 1] = offsets[i] + len(ray.indices)
+        total = int(offsets[-1])
+        indices = np.empty(total, dtype=np.int64)
+        dl = np.empty(total, dtype=np.float64)
+        for i, ray in enumerate(rays):
+            first = offsets[i]
+            last = offsets[i + 1]
+            indices[first:last] = ray.indices
+            dl[first:last] = ray.dl
+
+        return MeshlessVoronoiRayBatch(
+            ray_offsets=offsets,
+            indices=indices,
+            dl=dl,
+            start_positions=np.asarray(starts, dtype=np.float64),
+            end_positions=np.asarray(ends, dtype=np.float64),
+            directions=np.asarray(directions, dtype=np.float64),
+            lengths=np.asarray(lengths, dtype=np.float64),
+            start_indices=np.asarray([ray.start_index for ray in rays], dtype=np.int64),
+            end_indices=np.asarray([ray.end_index for ray in rays], dtype=np.int64),
+            failed_stack_recoveries=np.asarray(
+                [ray.failed_stack_recoveries for ray in rays], dtype=np.int64
+            ),
+            fallback_counts=np.asarray([ray.fallback_count for ray in rays], dtype=np.int64),
+            nudge_counts=np.asarray([ray.nudge_count for ray in rays], dtype=np.int64),
             eps=float(self.eps),
             periodic=self.box_size is not None,
             box_size=None if self.box_size is None else np.asarray(self.box_size),

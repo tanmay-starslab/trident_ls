@@ -30,7 +30,8 @@ from trident.meshless_voronoi_ray import \
     MeshlessVoronoiRayTracer
 from trident.meshless_ray_io import \
     load_meshless_ray, \
-    write_meshless_ray_hdf5
+    write_meshless_ray_hdf5, \
+    write_meshless_ray_catalog_hdf5
 from yt.utilities.logger import \
     ytLogger as mylog
 from yt.utilities.physical_constants import \
@@ -438,6 +439,149 @@ def make_meshless_voronoi_ray(
     )
     return load_meshless_ray(data_filename)
 
+def make_meshless_voronoi_ray_catalog(
+        dataset_file,
+        starts,
+        ends=None,
+        directions=None,
+        lengths=None,
+        lines=None,
+        fields=None,
+        output_filename=None,
+        output_dir=None,
+        one_file_per_ray=False,
+        parallel="none",
+        n_jobs=1,
+        chunksize=1000,
+        position_field=("gas", "coordinates"),
+        velocity_field=None,
+        periodic=False,
+        redshift=None,
+        field_parameters=None,
+        setup_function=None,
+        load_kwargs=None,
+        line_database=None,
+        ionization_table=None,
+        diagnostics=True,
+        overwrite=False,
+        fail_empty=True,
+        **meshless_kwargs):
+    """Trace and optionally write a catalog of meshless Voronoi sightlines.
+
+    This high-level batch API loads the dataset once, builds one meshless
+    nearest-neighbor tree, traces all supplied rays, samples requested fields
+    with flattened cell indices, and writes a compact ragged HDF5 catalog when
+    ``output_filename`` is supplied.
+
+    Existing single-ray behavior is unchanged; use ``make_meshless_voronoi_ray``
+    when a Trident/SpectrumGenerator-ready single ray file is needed directly.
+    """
+    if load_kwargs is None:
+        load_kwargs = {}
+    if field_parameters is None:
+        field_parameters = {}
+    if fields is None:
+        fields = []
+    else:
+        fields = list(fields)
+
+    if isinstance(dataset_file, str):
+        ds = load(dataset_file, **load_kwargs)
+    elif isinstance(dataset_file, Dataset):
+        ds = dataset_file
+    else:
+        raise RuntimeError("dataset_file must be a filename or yt Dataset.")
+
+    if setup_function is not None:
+        setup_function(ds)
+    if ionization_table is None:
+        ionization_table = ion_table_filepath
+
+    fields = _add_default_fields(ds, fields)
+    if lines is not None:
+        ion_list = _determine_ions_from_lines(line_database, lines)
+        fields = _determine_fields_from_ions(ds, ion_list, fields)
+    for i in range(len(fields)):
+        if isinstance(fields[i], str):
+            fields[i] = ('gas', fields[i])
+    fields = uniquify(fields)
+
+    ad = ds.all_data()
+    for key, val in field_parameters.items():
+        ad.set_field_parameter(key, val)
+
+    position_field, positions = _resolve_meshless_position_field(ds, ad, position_field)
+    positions_code = positions.to('code_length')
+    starts_code = _meshless_positions_to_code_array(ds, starts)
+    if ends is not None:
+        ends_code = _meshless_positions_to_code_array(ds, ends)
+        directions_code = None
+        lengths_code = None
+    else:
+        ends_code = None
+        directions_code = np.asarray(directions, dtype=np.float64)
+        lengths_code = _meshless_lengths_to_code_array(ds, lengths)
+
+    box_size = meshless_kwargs.pop("box_size", None)
+    if periodic:
+        if box_size is None:
+            box_size = ds.domain_width.to('code_length').d
+    else:
+        box_size = None
+
+    tracer = MeshlessVoronoiRayTracer(
+        positions_code.d,
+        box_size=box_size,
+        **meshless_kwargs
+    )
+    batch = tracer.trace_rays(
+        starts_code,
+        end_positions=ends_code,
+        directions=directions_code,
+        lengths=lengths_code,
+        parallel=parallel,
+        n_jobs=n_jobs,
+        chunksize=chunksize,
+        return_format="ragged",
+    )
+
+    data = _meshless_catalog_flat_fields(
+        ds, ad, batch, fields, velocity_field, field_parameters, redshift,
+        len(positions_code), positions
+    )
+
+    metadata = {
+        "meshless_position_field": str(position_field),
+        "meshless_extra_fields_version": "1",
+        "n_rays": int(batch.n_rays),
+        "n_segments": int(len(batch.indices)),
+        "diagnostics": bool(diagnostics),
+    }
+    if hasattr(ds, "unique_identifier"):
+        metadata["source_unique_identifier"] = str(ds.unique_identifier)
+    if hasattr(ds, "parameter_filename"):
+        metadata["source_parameter_filename"] = str(ds.parameter_filename)
+
+    if output_filename is not None:
+        write_meshless_ray_catalog_hdf5(
+            output_filename,
+            batch,
+            fields=data,
+            metadata=metadata,
+            overwrite=overwrite,
+        )
+
+    if one_file_per_ray:
+        if output_dir is None:
+            raise ValueError("output_dir is required when one_file_per_ray=True.")
+        _write_catalog_individual_rays(
+            ds, batch, data, output_dir, fail_empty=fail_empty, overwrite=overwrite
+        )
+
+    if output_filename is not None:
+        return output_filename
+    return batch
+
 def make_compound_ray(parameter_filename, simulation_type,
                       near_redshift, far_redshift,
                       lines=None, ftype='gas', fields=None,
@@ -743,6 +887,26 @@ def _meshless_length_to_code(ds, length):
         return float(length.to('code_length').d)
     return float(ds.quan(length, 'code_length').to('code_length').d)
 
+def _meshless_positions_to_code_array(ds, positions):
+    if hasattr(positions, "to"):
+        arr = positions.to('code_length').d
+    else:
+        arr = ds.arr(positions, 'code_length').to('code_length').d
+    arr = np.asarray(arr, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[1] != 3:
+        raise ValueError("positions must have shape (M, 3).")
+    return arr
+
+def _meshless_lengths_to_code_array(ds, lengths):
+    if hasattr(lengths, "to"):
+        arr = lengths.to('code_length').d
+    else:
+        arr = ds.arr(lengths, 'code_length').to('code_length').d
+    arr = np.asarray(arr, dtype=np.float64)
+    if arr.ndim != 1:
+        raise ValueError("lengths must have shape (M,).")
+    return arr
+
 def _meshless_redshift(ds, redshift):
     if redshift is not None:
         return float(redshift)
@@ -869,6 +1033,113 @@ def _sample_meshless_field(ad, field, indices):
             (field, exc)
         )
     return values[indices]
+
+def _sample_meshless_field_flat(ad, field, indices):
+    try:
+        values = ad[field]
+    except Exception as exc:
+        raise RuntimeError(
+            "Required meshless ray field %s is not available: %s" %
+            (field, exc)
+        )
+    unique_indices, inverse = np.unique(indices, return_inverse=True)
+    return values[unique_indices][inverse]
+
+def _meshless_catalog_flat_fields(
+        ds, ad, batch, fields, velocity_field, field_parameters, redshift,
+        n_positions, positions):
+    ray_ids = np.repeat(np.arange(batch.n_rays), batch.n_segments)
+    ray_indices = batch.indices
+    velocity_all = _resolve_meshless_velocity(ds, ad, velocity_field, n_positions)
+    velocity = velocity_all[ray_indices]
+    bulk_velocity = field_parameters.get("bulk_velocity", None)
+    if bulk_velocity is not None:
+        if hasattr(bulk_velocity, "to"):
+            bulk_velocity = bulk_velocity.to('cm/s')
+        else:
+            bulk_velocity = ds.arr(bulk_velocity, 'cm/s')
+        velocity = velocity - bulk_velocity
+
+    directions_flat = ds.arr(-batch.directions[ray_ids], "")
+    velocity_los = (velocity * directions_flat).sum(axis=1).to('cm/s')
+    dl = ds.arr(batch.dl, 'code_length').in_cgs()
+    cumulative_dl = ds.arr(batch.cumulative_dl, 'code_length').in_cgs()
+    l = cumulative_dl - 0.5 * dl
+    l_code = batch.cumulative_dl - 0.5 * batch.dl
+
+    redshift_arr = np.empty(len(ray_indices), dtype=np.float64)
+    for ray_id in range(batch.n_rays):
+        start = batch.ray_offsets[ray_id]
+        end = batch.ray_offsets[ray_id + 1]
+        total_length = ds.quan(batch.lengths[ray_id], 'code_length').in_cgs()
+        redshift_arr[start:end] = _meshless_redshift_array(
+            ds, redshift, l[start:end], total_length
+        )
+    velocity_mag = np.sqrt((velocity * velocity).sum(axis=1)).to('cm/s')
+    beta2 = (velocity_mag / speed_of_light_cgs).to("").d ** 2
+    beta2 = np.clip(beta2, 0.0, 1.0 - np.finfo(np.float64).eps)
+    redshift_dopp = (
+        (1.0 + (velocity_los / speed_of_light_cgs).to("").d) /
+        np.sqrt(1.0 - beta2)
+    ) - 1.0
+    redshift_eff = ((1.0 + redshift_arr) * (1.0 + redshift_dopp)) - 1.0
+
+    ray_positions_code = (
+        batch.start_positions[ray_ids] +
+        l_code[:, None] * batch.directions[ray_ids]
+    )
+    if batch.periodic and batch.box_size is not None:
+        ray_positions_code = np.mod(ray_positions_code, batch.box_size)
+    ray_positions = ds.arr(ray_positions_code, 'code_length').in_cgs()
+    generator_positions = positions[ray_indices].to('code_length').in_cgs()
+
+    data = {
+        ('gas', 'dl'): dl,
+        ('gas', 'l'): l,
+        ('gas', 'redshift'): redshift_arr,
+        ('gas', 'redshift_dopp'): redshift_dopp,
+        ('gas', 'redshift_eff'): redshift_eff,
+        ('gas', 'velocity_los'): velocity_los,
+        ('gas', 'v_los'): velocity_los,
+        ('gas', 'meshless_cell_index'): ray_indices.astype(np.int64),
+        ('gas', 'cumulative_dl'): cumulative_dl,
+        ('gas', 'x'): ray_positions[:, 0],
+        ('gas', 'y'): ray_positions[:, 1],
+        ('gas', 'z'): ray_positions[:, 2],
+        ('gas', 'relative_velocity_x'): velocity[:, 0].to('cm/s'),
+        ('gas', 'relative_velocity_y'): velocity[:, 1].to('cm/s'),
+        ('gas', 'relative_velocity_z'): velocity[:, 2].to('cm/s'),
+    }
+    data[('gas', 'meshless_generator_x')] = generator_positions[:, 0]
+    data[('gas', 'meshless_generator_y')] = generator_positions[:, 1]
+    data[('gas', 'meshless_generator_z')] = generator_positions[:, 2]
+
+    for field in fields:
+        if field in data:
+            continue
+        data[field] = _sample_meshless_field_flat(ad, field, ray_indices)
+    return data
+
+def _write_catalog_individual_rays(ds, batch, data, output_dir, fail_empty=True, overwrite=False):
+    from pathlib import Path
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for ray_id in range(batch.n_rays):
+        start = int(batch.ray_offsets[ray_id])
+        end = int(batch.ray_offsets[ray_id + 1])
+        filename = output_dir / ("meshless_ray_%05d.h5" % ray_id)
+        if filename.exists() and not overwrite:
+            raise FileExistsError("%s exists. Pass overwrite=True." % filename)
+        ray_data = {}
+        for field, values in data.items():
+            ray_data[field] = values[start:end]
+        attrs = {}
+        for key, value in batch.ray(ray_id).metadata.items():
+            attrs["meshless_%s" % key] = value
+        write_meshless_ray_hdf5(
+            ds, str(filename), ray_data, extra_attrs=attrs, fail_empty=fail_empty
+        )
 
 def _meshless_metadata_attrs(ds, ray, position_field):
     attrs = {}
