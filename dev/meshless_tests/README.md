@@ -149,3 +149,80 @@ tracing and catalog writing:
 
 The script writes CSV/JSON summaries and runtime plots under the selected
 output directory.  Those outputs are ignored and should not be committed.
+
+## LightRay vs Meshless Comparison Suite
+
+`compare_lightray_vs_meshless_suite.py` is the main validation entrypoint for
+side-by-side science and timing checks.  It generates deterministic sightline
+sets, traces all rays with the optimized meshless batch path, traces a
+controlled subset with yt/Trident `LightRay`, optionally generates spectra with
+the unchanged Trident `SpectrumGenerator`, and writes ray, spectrum, timing, and
+plot summaries.
+
+Small validation run:
+
+```bash
+/Users/wavefunction/github_repos/m61-tng/.venv/bin/python \
+    dev/meshless_tests/compare_lightray_vs_meshless_suite.py \
+    --dataset "/Users/wavefunction/ASU Dropbox/Tanmay Singh/M61/data/cutout_398784.hdf5" \
+    --output-dir /private/tmp/trident_meshless_lightray_comparison_small \
+    --scenario uniform_xy_grid radial_area_uniform_xy \
+    --nrays-total 20 \
+    --nrays-lightray 10 \
+    --nrays-spectra 5 \
+    --seed 398784 \
+    --instrument COS-G130M \
+    --periodic false \
+    --make-plots \
+    --make-spectra \
+    --benchmark \
+    --overwrite
+```
+
+Full 500-ish validation run:
+
+```bash
+/Users/wavefunction/github_repos/m61-tng/.venv/bin/python \
+    dev/meshless_tests/compare_lightray_vs_meshless_suite.py \
+    --dataset "/Users/wavefunction/ASU Dropbox/Tanmay Singh/M61/data/cutout_398784.hdf5" \
+    --output-dir /private/tmp/trident_meshless_lightray_comparison_500 \
+    --scenario all \
+    --nrays-total 500 \
+    --nrays-lightray 100 \
+    --nrays-spectra 50 \
+    --seed 398784 \
+    --instrument COS-G130M \
+    --periodic false \
+    --make-plots \
+    --make-spectra \
+    --benchmark \
+    --overwrite
+```
+
+The output tree is:
+
+- `summary/`: per-scenario and aggregate CSV/JSON metrics.
+- `rays/lightray/` and `rays/meshless/`: single-ray HDF5 files used for direct
+  SpectrumGenerator comparisons.
+- `spectra/lightray/` and `spectra/meshless/`: spectrum files by line group.
+- `plots/ray_diagnostics/`: per-ray field and residual plots.
+- `plots/spectra_diagnostics/`: per-ray spectrum and flux residual plots.
+- `plots/summary/`: sightline layout, ray summary, spectra summary, timing, and
+  speedup figures.
+
+Expected runtime depends mostly on the number of LightRay and spectrum rays.
+The default full command runs meshless for all requested sightlines but only
+uses LightRay for the selected subset, then projects the LightRay runtime to the
+full ray count.  Use `--full-lightray-500` only when you intentionally want to
+pay for all LightRay traces.
+
+Interpretation: LightRay and meshless Voronoi rays are different geometric
+models.  Do not expect segment counts, sampled gas cells, columns, or spectra to
+match exactly.  Sanity checks should focus on path-length coverage, finite
+fields, successful SpectrumGenerator output, and whether differences are
+consistent with the two sampling geometries.  Large residuals are diagnostics to
+inspect, not automatic failures.
+
+Generated suite outputs should stay under `/private/tmp` or an ignored
+`dev/meshless_tests/outputs/`-style directory.  Do not commit ray files,
+spectra, plots, benchmark summaries, logs, caches, or local datasets.
