@@ -30,3 +30,31 @@ dev/meshless_tests/**/__pycache__/
 /comparison_outputs/
 /meshless_test_outputs/
 /internal_meshless_outputs/
+salsa/
+
+# Manim generated media
+media/
+videos/
+images/
+partial_movie_files/
+tex/
+tex_template.tex
+
+# Manim outputs inside dev diagnostics
+dev/meshless_tests/media/
+dev/meshless_tests/videos/
+dev/meshless_tests/images/
+dev/meshless_tests/partial_movie_files/
+dev/meshless_tests/tex/
+dev/meshless_tests/*.mp4
+dev/meshless_tests/*.mov
+dev/meshless_tests/*.webm
+dev/meshless_tests/*.gif
+dev/meshless_tests/*.ipynb
+
+# LaTeX/Manim temporary files
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
