@@ -18,11 +18,16 @@ dev/meshless_tests/internal_meshless_outputs/
 dev/meshless_tests/comparison_outputs/
 dev/meshless_tests/outputs/
 dev/meshless_tests/output/
+dev/meshless_tests/**/rays/
+dev/meshless_tests/**/spectra/
+dev/meshless_tests/**/plots/
 dev/meshless_tests/**/*.h5
 dev/meshless_tests/**/*.hdf5
 dev/meshless_tests/**/*.png
 dev/meshless_tests/**/*.pdf
 dev/meshless_tests/**/*.log
+dev/meshless_tests/**/*.csv
+dev/meshless_tests/**/*.json
 dev/meshless_tests/**/*summary*.csv
 dev/meshless_tests/**/*summary*.json
 dev/meshless_tests/**/.ipynb_checkpoints/
