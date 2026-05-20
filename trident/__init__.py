@@ -63,7 +63,8 @@ from trident.utilities import \
 
 from trident.ray_generator import \
     make_simple_ray, \
-    make_compound_ray
+    make_compound_ray, \
+    make_meshless_voronoi_ray
 
 from trident.meshless_voronoi_ray import \
     MeshlessVoronoiRay, \
