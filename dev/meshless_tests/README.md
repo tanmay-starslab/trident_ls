@@ -53,3 +53,99 @@ ion density fields.
 
 Generated HDF5 files, plots, logs, summaries, and caches are ignored by git.
 Do not commit generated diagnostics or the local TNG cutout.
+
+## Profiling
+
+Geometry-only profiling separates dataset load, position extraction, KDTree
+construction, and ray walking:
+
+```bash
+/Users/wavefunction/github_repos/m61-tng/.venv/bin/python \
+    dev/meshless_tests/profile_meshless_raytracing.py \
+    --mode synthetic \
+    --npoints 1000 10000 \
+    --nrays 1 10 100 \
+    --output-dir /private/tmp/trident_meshless_profile \
+    --profile none
+```
+
+For the local TNG cutout:
+
+```bash
+/Users/wavefunction/github_repos/m61-tng/.venv/bin/python \
+    dev/meshless_tests/profile_meshless_raytracing.py \
+    --mode tng \
+    --dataset "/Users/wavefunction/ASU Dropbox/Tanmay Singh/M61/data/cutout_398784.hdf5" \
+    --nrays 1 5 \
+    --output-dir /private/tmp/trident_meshless_profile_tng \
+    --periodic false
+```
+
+## Batch Sightlines And Catalogs
+
+The optimized path keeps the single-ray API unchanged and adds tree-reusing
+batch helpers:
+
+```python
+import trident
+
+sightlines = trident.generate_uniform_grid_sightlines(
+    center=[0, 0, 0],
+    width=200,
+    height=200,
+    nx=20,
+    ny=20,
+    plane="xy",
+    length=300,
+)
+
+catalog = trident.make_meshless_voronoi_ray_catalog(
+    ds,
+    sightlines.starts,
+    ends=sightlines.ends,
+    lines=["H I", "O VI"],
+    output_filename="/private/tmp/meshless_catalog.h5",
+    periodic=False,
+    overwrite=True,
+)
+```
+
+Radial sightlines around a galaxy center use area-uniform impact parameters by
+default:
+
+```python
+sightlines = trident.generate_radial_sightlines(
+    center=galaxy_center,
+    radius=150,
+    nrays=1000,
+    plane="xy",
+    length=300,
+    seed=398784,
+)
+```
+
+Threaded batch tracing is optional:
+
+```python
+tracer.trace_rays(starts, end_positions=ends, parallel="threads", n_jobs=4)
+```
+
+Use `parallel="none"` for the most conservative behavior.  Threaded mode is
+tested to match serial batch tracing on deterministic synthetic cases.
+
+## Many-Ray Benchmarks
+
+Benchmark the old per-ray tree rebuild path against batch serial/threaded
+tracing and catalog writing:
+
+```bash
+/Users/wavefunction/github_repos/m61-tng/.venv/bin/python \
+    dev/meshless_tests/benchmark_many_sightlines.py \
+    --mode synthetic \
+    --npoints 10000 \
+    --nrays 1 10 100 \
+    --output-dir /private/tmp/trident_meshless_benchmarks
+```
+
+The script writes CSV/JSON summaries and runtime plots under the selected
+output directory.  Those outputs are ignored and should not be committed.

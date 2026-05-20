@@ -64,12 +64,21 @@ from trident.utilities import \
 from trident.ray_generator import \
     make_simple_ray, \
     make_compound_ray, \
-    make_meshless_voronoi_ray
+    make_meshless_voronoi_ray, \
+    make_meshless_voronoi_ray_catalog
 
 from trident.meshless_voronoi_ray import \
     MeshlessVoronoiRay, \
+    MeshlessVoronoiRayBatch, \
     MeshlessVoronoiRayTracer, \
     meshless_voronoi_ray
+
+from trident.meshless_sightlines import \
+    MeshlessSightlineSet, \
+    generate_uniform_grid_sightlines, \
+    generate_radial_sightlines, \
+    generate_random_parallel_sightlines, \
+    trace_meshless_sightline_batch
 
 from trident.roman import \
     to_roman, \
