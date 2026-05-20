@@ -26,6 +26,16 @@ from yt.data_objects.static_output import \
     Dataset
 from trident.ion_balance import \
     atomic_number
+from trident.meshless_voronoi_ray import \
+    MeshlessVoronoiRayTracer
+from trident.meshless_ray_io import \
+    load_meshless_ray, \
+    write_meshless_ray_hdf5
+from yt.utilities.logger import \
+    ytLogger as mylog
+from yt.utilities.physical_constants import \
+    speed_of_light_cgs
+import numpy as np
 
 def make_simple_ray(dataset_file, start_position, end_position,
                     lines=None, ftype="gas", fields=None,
@@ -241,6 +251,192 @@ def make_simple_ray(dataset_file, start_position, end_position,
                              field_parameters=field_parameters,
                              redshift=redshift,
                              fail_empty=fail_empty)
+
+def make_meshless_voronoi_ray(
+        dataset_file,
+        start_position,
+        end_position=None,
+        direction=None,
+        length=None,
+        lines=None,
+        ftype="gas",
+        fields=None,
+        solution_filename=None,
+        data_filename=None,
+        redshift=None,
+        field_parameters=None,
+        setup_function=None,
+        load_kwargs=None,
+        line_database=None,
+        ionization_table=None,
+        position_field=("gas", "coordinates"),
+        velocity_field=None,
+        periodic=False,
+        extra_ray_fields=True,
+        store_meshless_metadata=True,
+        fail_empty=True,
+        **meshless_kwargs):
+    """
+    Create a Trident-compatible ray using meshless Voronoi geometry.
+
+    This function mirrors :func:`make_simple_ray` for a single loaded dataset,
+    but replaces yt's native ray traversal with a SALSA-style meshless Voronoi
+    walk over gas/cell generating-site positions.  The saved ray is a yt data
+    dataset tagged as ``yt_light_ray`` so it can be consumed by Trident's
+    existing :class:`~trident.SpectrumGenerator`.
+    """
+    if load_kwargs is None:
+        load_kwargs = {}
+    if field_parameters is None:
+        field_parameters = {}
+    if fields is None:
+        fields = []
+    else:
+        fields = list(fields)
+    if data_filename is None:
+        data_filename = 'ray.h5'
+
+    if isinstance(dataset_file, str):
+        ds = load(dataset_file, **load_kwargs)
+    elif isinstance(dataset_file, Dataset):
+        ds = dataset_file
+    else:
+        raise RuntimeError("dataset_file must be a filename or yt Dataset.")
+
+    if setup_function is not None:
+        setup_function(ds)
+
+    if ionization_table is None:
+        ionization_table = ion_table_filepath
+
+    fields = _add_default_fields(ds, fields)
+    if lines is not None:
+        ion_list = _determine_ions_from_lines(line_database, lines)
+        fields = _determine_fields_from_ions(ds, ion_list, fields)
+
+    for i in range(len(fields)):
+        if isinstance(fields[i], str):
+            fields[i] = ('gas', fields[i])
+    fields = uniquify(fields)
+
+    ad = ds.all_data()
+    for key, val in field_parameters.items():
+        ad.set_field_parameter(key, val)
+
+    position_field, positions = _resolve_meshless_position_field(
+        ds, ad, position_field
+    )
+    positions_code = positions.to('code_length')
+
+    start_code = _meshless_position_to_code(ds, start_position)
+    ray_kwargs = {"start_position": start_code}
+    if end_position is not None:
+        ray_kwargs["end_position"] = _meshless_position_to_code(ds, end_position)
+    else:
+        if direction is None or length is None:
+            raise ValueError("Provide end_position or both direction and length.")
+        ray_kwargs["direction"] = np.asarray(direction, dtype=np.float64)
+        ray_kwargs["length"] = _meshless_length_to_code(ds, length)
+
+    box_size = meshless_kwargs.pop("box_size", None)
+    if periodic:
+        if box_size is None:
+            box_size = ds.domain_width.to('code_length').d
+    else:
+        box_size = None
+
+    tracer = MeshlessVoronoiRayTracer(
+        positions_code.d,
+        box_size=box_size,
+        **meshless_kwargs
+    )
+    meshless_ray = tracer.trace_ray(**ray_kwargs)
+    ray_indices = meshless_ray.indices
+
+    velocity = _resolve_meshless_velocity(ds, ad, velocity_field, len(positions_code))
+    velocity = velocity[ray_indices]
+    bulk_velocity = field_parameters.get("bulk_velocity", None)
+    if bulk_velocity is not None:
+        if hasattr(bulk_velocity, "to"):
+            bulk_velocity = bulk_velocity.to('cm/s')
+        else:
+            bulk_velocity = ds.arr(bulk_velocity, 'cm/s')
+        velocity = velocity - bulk_velocity
+
+    # Match yt LightRay's convention: line_of_sight points from the ray end
+    # back toward the ray start, i.e. start - end.
+    line_of_sight = ds.arr(-meshless_ray.direction, "")
+    velocity_los = (velocity * line_of_sight).sum(axis=1).to('cm/s')
+
+    dl = ds.arr(meshless_ray.dl, 'code_length').in_cgs()
+    cumulative_dl = ds.arr(meshless_ray.cumulative_dl, 'code_length').in_cgs()
+    l = cumulative_dl - 0.5 * dl
+
+    redshift_arr = _meshless_redshift_array(
+        ds, redshift, l, ds.quan(meshless_ray.length, 'code_length').in_cgs()
+    )
+    velocity_mag = np.sqrt((velocity * velocity).sum(axis=1)).to('cm/s')
+    beta2 = (velocity_mag / speed_of_light_cgs).to("").d ** 2
+    beta2 = np.clip(beta2, 0.0, 1.0 - np.finfo(np.float64).eps)
+    redshift_dopp = (
+        (1.0 + (velocity_los / speed_of_light_cgs).to("").d) /
+        np.sqrt(1.0 - beta2)
+    ) - 1.0
+    redshift_eff = ((1.0 + redshift_arr) * (1.0 + redshift_dopp)) - 1.0
+
+    data = {
+        ('gas', 'dl'): dl,
+        ('gas', 'l'): l,
+        ('gas', 'redshift'): redshift_arr,
+        ('gas', 'redshift_dopp'): redshift_dopp,
+        ('gas', 'redshift_eff'): redshift_eff,
+        ('gas', 'velocity_los'): velocity_los,
+        ('gas', 'v_los'): velocity_los,
+    }
+
+    for field in fields:
+        if field in data:
+            continue
+        data[field] = _sample_meshless_field(ad, field, ray_indices)
+
+    l_code = meshless_ray.cumulative_dl - 0.5 * meshless_ray.dl
+    ray_positions_code = (
+        meshless_ray.start_position[None, :] +
+        l_code[:, None] * meshless_ray.direction[None, :]
+    )
+    if meshless_ray.periodic and meshless_ray.box_size is not None:
+        ray_positions_code = np.mod(ray_positions_code, meshless_ray.box_size)
+    ray_positions = ds.arr(ray_positions_code, 'code_length').in_cgs()
+    generator_positions = positions[ray_indices].to('code_length').in_cgs()
+    data[('gas', 'x')] = ray_positions[:, 0]
+    data[('gas', 'y')] = ray_positions[:, 1]
+    data[('gas', 'z')] = ray_positions[:, 2]
+
+    if extra_ray_fields:
+        data[('gas', 'meshless_cell_index')] = ray_indices.astype(np.int64)
+        data[('gas', 'cumulative_dl')] = cumulative_dl
+        data[('gas', 'meshless_generator_x')] = generator_positions[:, 0]
+        data[('gas', 'meshless_generator_y')] = generator_positions[:, 1]
+        data[('gas', 'meshless_generator_z')] = generator_positions[:, 2]
+        data[('gas', 'relative_velocity_x')] = velocity[:, 0].to('cm/s')
+        data[('gas', 'relative_velocity_y')] = velocity[:, 1].to('cm/s')
+        data[('gas', 'relative_velocity_z')] = velocity[:, 2].to('cm/s')
+
+    extra_attrs = {}
+    if store_meshless_metadata:
+        extra_attrs.update(_meshless_metadata_attrs(ds, meshless_ray, position_field))
+
+    if solution_filename is not None:
+        _write_meshless_solution(solution_filename, meshless_ray)
+
+    write_meshless_ray_hdf5(
+        ds,
+        data_filename,
+        data,
+        extra_attrs=extra_attrs,
+        fail_empty=fail_empty,
+    )
+    return load_meshless_ray(data_filename)
 
 def make_compound_ray(parameter_filename, simulation_type,
                       near_redshift, far_redshift,
@@ -536,6 +732,166 @@ def make_compound_ray(parameter_filename, simulation_type,
                              redshift=None, njobs=-1,
                              field_parameters = field_parameters,
                              fail_empty=fail_empty)
+
+def _meshless_position_to_code(ds, position):
+    if hasattr(position, "to"):
+        return position.to('code_length').d
+    return ds.arr(position, 'code_length').to('code_length').d
+
+def _meshless_length_to_code(ds, length):
+    if hasattr(length, "to"):
+        return float(length.to('code_length').d)
+    return float(ds.quan(length, 'code_length').to('code_length').d)
+
+def _meshless_redshift(ds, redshift):
+    if redshift is not None:
+        return float(redshift)
+    if hasattr(ds, "current_redshift"):
+        try:
+            return float(ds.current_redshift)
+        except TypeError:
+            pass
+    return 0.0
+
+def _meshless_redshift_array(ds, redshift, l, total_length):
+    z_start = _meshless_redshift(ds, redshift)
+    if len(l) == 0:
+        return np.array([], dtype=np.float64)
+    if not getattr(ds, "cosmological_simulation", False):
+        return np.full(len(l), z_start, dtype=np.float64)
+    try:
+        segment_length = total_length.in_units("Mpccm / h")
+        z_next = z_start - LightRay(ds)._deltaz_forward(z_start, segment_length)
+        fraction = (l / total_length).to("").d
+        return z_start - fraction * (z_start - float(z_next))
+    except Exception:
+        return np.full(len(l), z_start, dtype=np.float64)
+
+def _resolve_meshless_position_field(ds, ad, position_field):
+    if _meshless_component_field_spec(position_field):
+        components = [ad[field].to('code_length') for field in position_field]
+        positions = ds.arr(np.column_stack([component.d for component in components]),
+                           'code_length')
+        return position_field, positions
+
+    candidates = [position_field]
+    for fallback in [("gas", "coordinates"), ("PartType0", "Coordinates")]:
+        if fallback not in candidates:
+            candidates.append(fallback)
+
+    errors = []
+    for candidate in candidates:
+        try:
+            positions = ad[candidate]
+        except Exception as exc:
+            errors.append("%s: %s" % (candidate, exc))
+            continue
+        if len(getattr(positions, "shape", ())) != 2 or positions.shape[1] != 3:
+            errors.append("%s: expected shape (N, 3), got %s" %
+                          (candidate, getattr(positions, "shape", None)))
+            continue
+        if candidate != position_field:
+            mylog.warning(
+                "Using fallback meshless position field %s instead of %s.",
+                candidate, position_field
+            )
+        if candidate[0] == "PartType0":
+            mylog.warning(
+                "Using raw PartType0 coordinates as Voronoi generating sites."
+            )
+        return candidate, positions
+
+    raise RuntimeError(
+        "Could not resolve a meshless position field. Tried: %s" %
+        "; ".join(errors)
+    )
+
+def _resolve_meshless_velocity(ds, ad, velocity_field, n_positions):
+    if velocity_field is not None:
+        if _meshless_component_field_spec(velocity_field):
+            components = [ad[field].to('cm/s') for field in velocity_field]
+            return ds.arr(np.column_stack([component.d for component in components]),
+                          'cm/s')
+        try:
+            velocity = ad[velocity_field]
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not load requested velocity_field %s: %s" %
+                (velocity_field, exc)
+            )
+        if len(getattr(velocity, "shape", ())) != 2 or velocity.shape[1] != 3:
+            raise RuntimeError(
+                "velocity_field %s must have shape (N, 3)." % (velocity_field,)
+            )
+        return velocity.to('cm/s')
+
+    component_sets = [
+        (("gas", "velocity_x"), ("gas", "velocity_y"), ("gas", "velocity_z")),
+        (("gas", "relative_velocity_x"), ("gas", "relative_velocity_y"),
+         ("gas", "relative_velocity_z")),
+    ]
+    for fields in component_sets:
+        try:
+            components = [ad[field].to('cm/s') for field in fields]
+        except Exception:
+            continue
+        return ds.arr(np.column_stack([component.d for component in components]),
+                      'cm/s')
+
+    for candidate in [("gas", "velocity"), ("PartType0", "Velocities")]:
+        try:
+            velocity = ad[candidate]
+        except Exception:
+            continue
+        if len(getattr(velocity, "shape", ())) == 2 and velocity.shape[1] == 3:
+            if candidate[0] == "PartType0":
+                mylog.warning("Using raw PartType0 velocities for velocity_los.")
+            return velocity.to('cm/s')
+
+    mylog.warning(
+        "No gas velocity field found for meshless ray; using zero velocity_los."
+    )
+    return ds.arr(np.zeros((n_positions, 3), dtype=np.float64), 'cm/s')
+
+def _meshless_component_field_spec(field_spec):
+    return (
+        isinstance(field_spec, (list, tuple)) and
+        len(field_spec) == 3 and
+        all(isinstance(field, tuple) for field in field_spec)
+    )
+
+def _sample_meshless_field(ad, field, indices):
+    try:
+        values = ad[field]
+    except Exception as exc:
+        raise RuntimeError(
+            "Required meshless ray field %s is not available: %s" %
+            (field, exc)
+        )
+    return values[indices]
+
+def _meshless_metadata_attrs(ds, ray, position_field):
+    attrs = {}
+    for key, value in ray.metadata.items():
+        attrs["meshless_%s" % key] = value
+    attrs["meshless_position_field"] = str(position_field)
+    attrs["meshless_extra_fields_version"] = "1"
+    if hasattr(ds, "unique_identifier"):
+        attrs["meshless_source_unique_identifier"] = str(ds.unique_identifier)
+    if hasattr(ds, "parameter_filename"):
+        attrs["meshless_source_parameter_filename"] = str(ds.parameter_filename)
+    return attrs
+
+def _write_meshless_solution(filename, ray):
+    with open(filename, "w") as handle:
+        handle.write("# Meshless Voronoi ray solution\n")
+        handle.write("# start %s\n" % " ".join(map(str, ray.start_position)))
+        handle.write("# end %s\n" % " ".join(map(str, ray.end_position)))
+        handle.write("# direction %s\n" % " ".join(map(str, ray.direction)))
+        handle.write("# length %s\n" % ray.length)
+        handle.write("# index dl cumulative_dl\n")
+        for index, dl, cumulative in zip(ray.indices, ray.dl, ray.cumulative_dl):
+            handle.write("%d %.17e %.17e\n" % (index, dl, cumulative))
 
 def _determine_ions_from_lines(line_database, lines):
     """

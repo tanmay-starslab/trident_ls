@@ -54,6 +54,14 @@ class MeshlessVoronoiRay:
         Unit direction vector from start to end.
     length : float
         Total requested ray length.
+    start_index, end_index : int
+        Nearest Voronoi site indices at the ray start and final point.
+    failed_stack_recoveries : int
+        Number of times a failed candidate seeded a later crossing search.
+    fallback_count : int
+        Number of conservative bisection fallbacks used.
+    nudge_count : int
+        Number of numerical near-face nudges used to avoid zero-length loops.
     """
 
     indices: np.ndarray
@@ -62,11 +70,40 @@ class MeshlessVoronoiRay:
     end_position: np.ndarray
     direction: np.ndarray
     length: float
+    start_index: int = -1
+    end_index: int = -1
+    failed_stack_recoveries: int = 0
+    fallback_count: int = 0
+    nudge_count: int = 0
+    eps: float = np.nan
+    periodic: bool = False
+    box_size: Optional[np.ndarray] = None
+    algorithm_version: str = "salsa_meshless_voronoi_v1"
 
     @property
     def cumulative_dl(self) -> np.ndarray:
         """Cumulative distance at the end of each ray segment."""
         return np.cumsum(self.dl)
+
+    @property
+    def metadata(self) -> dict:
+        """Return scalar diagnostics suitable for storing with a ray file."""
+        return {
+            "algorithm_version": self.algorithm_version,
+            "ray_start": self.start_position,
+            "ray_end": self.end_position,
+            "ray_direction": self.direction,
+            "ray_length": self.length,
+            "nearest_index_start": self.start_index,
+            "nearest_index_end": self.end_index,
+            "number_of_cell_crossings": max(len(self.indices) - 1, 0),
+            "failed_stack_recoveries": self.failed_stack_recoveries,
+            "fallback_count": self.fallback_count,
+            "nudge_count": self.nudge_count,
+            "epsilon": self.eps,
+            "periodic": self.periodic,
+            "box_size": self.box_size,
+        }
 
 
 class MeshlessVoronoiRayTracer:
@@ -189,6 +226,9 @@ class MeshlessVoronoiRayTracer:
         lengths = []
         travelled = 0.0
         failed_stack: list[Tuple[int, float]] = []
+        failed_stack_recoveries = 0
+        fallback_count = 0
+        nudge_count = 0
 
         for _ in range(self.max_iter):
             remaining = total_length - travelled
@@ -201,9 +241,11 @@ class MeshlessVoronoiRayTracer:
                 travelled = total_length
                 break
 
-            step, i_next = self._next_cell_crossing(
+            step, i_next, used_failed_stack, used_fallback = self._next_cell_crossing(
                 r, ray_hat, i_cur, remaining, failed_stack
             )
+            failed_stack_recoveries += int(used_failed_stack)
+            fallback_count += int(used_fallback)
 
             if not np.isfinite(step) or step <= self.eps:
                 # Numerical degeneracy near a face or vertex.  Nudge forward
@@ -212,6 +254,7 @@ class MeshlessVoronoiRayTracer:
                 r = self._wrap_point(r + ray_hat * nudge)
                 travelled += nudge
                 i_cur = self.nearest_index(r)
+                nudge_count += 1
                 continue
 
             step = min(step, remaining)
@@ -242,6 +285,14 @@ class MeshlessVoronoiRayTracer:
             end_position=np.asarray(r0 + ray_hat * total_length, dtype=np.float64),
             direction=np.asarray(ray_hat, dtype=np.float64),
             length=float(total_length),
+            start_index=int(self.nearest_index(r0)),
+            end_index=int(i_final),
+            failed_stack_recoveries=int(failed_stack_recoveries),
+            fallback_count=int(fallback_count),
+            nudge_count=int(nudge_count),
+            eps=float(self.eps),
+            periodic=self.box_size is not None,
+            box_size=None if self.box_size is None else np.asarray(self.box_size),
         )
 
     def _next_cell_crossing(
@@ -251,12 +302,13 @@ class MeshlessVoronoiRayTracer:
         i_cur: int,
         remaining: float,
         failed_stack: list[Tuple[int, float]],
-    ) -> Tuple[float, int]:
+    ) -> Tuple[float, int, bool, bool]:
         """Find the next Voronoi face crossing without mesh construction."""
         x_cur = self.positions[i_cur]
         L = 0.0
         R = remaining
         i_end = -1
+        used_failed_stack = False
 
         # SALSA keeps failed candidates in a stack to seed future searches.
         # Remove self-candidates and try the nearest remaining failed distance.
@@ -265,6 +317,7 @@ class MeshlessVoronoiRayTracer:
             i_end, dist = min(failed_stack, key=lambda item: item[1])
             failed_stack.remove((i_end, dist))
             R = min(remaining, max(2.0 * dist, self.eps))
+            used_failed_stack = True
 
         dl_local = np.inf
         for n in range(self.max_bisect_iter):
@@ -305,7 +358,7 @@ class MeshlessVoronoiRayTracer:
                 dl_local = np.inf
                 continue
 
-            return max(dl_local, 0.0), i_end
+            return max(dl_local, 0.0), i_end, used_failed_stack, False
 
         # Conservative fallback: binary search the first point that no longer
         # belongs to the current cell, then return the cell at that boundary.
@@ -318,7 +371,7 @@ class MeshlessVoronoiRayTracer:
             else:
                 hi = mid
         i_next = self.nearest_index(r + ray_hat * hi)
-        return hi, i_next
+        return hi, i_next, used_failed_stack, True
 
     def _intersect_face_plane(
         self,
